@@ -83,6 +83,30 @@ class JsonApplication:
                 return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+            if method == "POST" and path == "/datasets":
+                return Response(201, self.service.register_dataset(actor, payload))
+            if method == "POST" and path == "/authorizations/import":
+                return Response(201, self.service.import_authorizations(actor, payload))
+            if method == "POST" and path == "/authorizations/revoke":
+                return Response(200, self.service.revoke_authorization(
+                    actor, payload["dataset_id"], payload["version"], payload["subject_id"], payload["reason"]
+                ))
+            if method == "POST" and path == "/training/plans":
+                return Response(201, self.service.submit_training_plan(actor, payload))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["training", "plans"] and parts[3] == "launch":
+                return Response(200, self.service.launch_plan(actor, parts[2], payload["site_id"]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["training", "plans"] and parts[3] == "running":
+                return Response(200, self.service.mark_plan_running(actor, parts[2]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["training", "plans"] and parts[3] == "dispose":
+                return Response(200, self.service.dispose_running_plan(
+                    actor, parts[2], payload["decision"], payload["note"]
+                ))
+            if method == "GET" and len(parts) == 4 and parts[:2] == ["training", "plans"] and parts[3] == "tenant":
+                return Response(200, self.service.tenant_plan_view(actor, parts[2]))
+            if method == "GET" and len(parts) == 4 and parts[:2] == ["training", "plans"] and parts[3] == "dispatcher":
+                return Response(200, self.service.dispatcher_plan_view(actor, parts[2]))
+            if method == "GET" and len(parts) == 4 and parts[:2] == ["training", "plans"] and parts[3] == "audit":
+                return Response(200, self.service.auditor_compliance_view(actor, parts[2]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})

@@ -70,6 +70,31 @@ def date_text(value: object, field: str) -> str:
         raise ValidationFailed(f"{field} 必须是 YYYY-MM-DD 日期") from exc
 
 
+def timestamp_text(value: object, field: str) -> str:
+    result = required_text(value, field, 40)
+    try:
+        parse_utc(result, field)
+    except ValueError as exc:
+        raise ValidationFailed(str(exc)) from exc
+    return result
+
+
+def unique_identifiers(value: object, field: str, *, maximum: int = 64) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValidationFailed(f"{field} 必须是非空数组")
+    if len(value) > maximum:
+        raise ValidationFailed(f"{field} 最多包含 {maximum} 项")
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in value:
+        identifier_value = identifier(item, f"{field}[]")
+        if identifier_value in seen:
+            raise ValidationFailed(f"{field} 不能包含重复值 {identifier_value}")
+        seen.add(identifier_value)
+        result.append(identifier_value)
+    return tuple(result)
+
+
 @dataclass(frozen=True, slots=True)
 class IndexQuote:
     market_index: str
@@ -104,6 +129,8 @@ class Facility:
     kind: str
     timezone: str
     capacity_gpu_hours: Decimal
+    region: str | None = None
+    network_zone: str | None = None
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "Facility":
@@ -113,6 +140,8 @@ class Facility:
         timezone = required_text(raw.get("timezone"), "timezone", 64)
         if "/" not in timezone and timezone != "UTC":
             raise ValidationFailed("timezone 必须是 IANA 时区或 UTC")
+        region = raw.get("region")
+        network_zone = raw.get("network_zone")
         return cls(
             facility_id=identifier(raw.get("facility_id"), "facility_id"),
             name=required_text(raw.get("name"), "name"),
@@ -121,6 +150,8 @@ class Facility:
             capacity_gpu_hours=decimal_value(
                 raw.get("capacity_gpu_hours"), "capacity_gpu_hours", minimum=Decimal("0")
             ),
+            region=None if region is None else identifier(region, "region"),
+            network_zone=None if network_zone is None else identifier(network_zone, "network_zone"),
         )
 
 
@@ -259,4 +290,88 @@ class SupplyScenario:
             ),
             route_capacity_changes=parsed_routes,
             demand_changes=parsed_demand,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetVersion:
+    """数据集的确定版本及其驻留地域范围。"""
+
+    dataset_id: str
+    version: str
+    name: str
+    regions: tuple[str, ...]
+    content_sha256: str
+    registered_at: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "DatasetVersion":
+        version = identifier(raw.get("version"), "version")
+        content_sha256 = required_text(raw.get("content_sha256"), "content_sha256", 128).lower()
+        if len(content_sha256) != 64 or any(ch not in "0123456789abcdef" for ch in content_sha256):
+            raise ValidationFailed("content_sha256 必须是 64 位十六进制摘要")
+        return cls(
+            dataset_id=identifier(raw.get("dataset_id"), "dataset_id"),
+            version=version,
+            name=required_text(raw.get("name"), "name"),
+            regions=unique_identifiers(raw.get("regions"), "regions"),
+            content_sha256=content_sha256,
+            registered_at=timestamp_text(raw.get("registered_at"), "registered_at"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationGrant:
+    """批量导入中的单条主体授权。"""
+
+    dataset_id: str
+    version: str
+    subject_id: str
+    granted_at: str
+    expires_at: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "AuthorizationGrant":
+        granted_at = timestamp_text(raw.get("granted_at"), "granted_at")
+        expires_at = timestamp_text(raw.get("expires_at"), "expires_at")
+        if parse_utc(expires_at) <= parse_utc(granted_at):
+            raise ValidationFailed("expires_at 必须晚于 granted_at")
+        return cls(
+            dataset_id=identifier(raw.get("dataset_id"), "dataset_id"),
+            version=identifier(raw.get("version"), "version"),
+            subject_id=identifier(raw.get("subject_id"), "subject_id"),
+            granted_at=granted_at,
+            expires_at=expires_at,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingPlanRequest:
+    """跨区域训练作业计划，必须引用确定的数据集版本。"""
+
+    plan_id: str
+    dataset_id: str
+    version: str
+    subject_id: str
+    product: str
+    requested_gpu_hours: Decimal
+    network_zone: str
+    idempotency_key: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "TrainingPlanRequest":
+        product = required_text(raw.get("product"), "product", 32)
+        if product not in PRODUCTS:
+            raise ValidationFailed("product 不是受支持的资源类型")
+        return cls(
+            plan_id=identifier(raw.get("plan_id"), "plan_id"),
+            dataset_id=identifier(raw.get("dataset_id"), "dataset_id"),
+            version=identifier(raw.get("version"), "version"),
+            subject_id=identifier(raw.get("subject_id"), "subject_id"),
+            product=product,
+            requested_gpu_hours=decimal_value(
+                raw.get("requested_gpu_hours"), "requested_gpu_hours", minimum=Decimal("0.001")
+            ),
+            network_zone=identifier(raw.get("network_zone"), "network_zone"),
+            idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
         )

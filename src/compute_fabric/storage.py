@@ -14,7 +14,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','compliance','tenant')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS facilities (
     kind TEXT NOT NULL,
     timezone TEXT NOT NULL,
     capacity_gpu_hours TEXT NOT NULL,
+    region TEXT,
+    network_zone TEXT,
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -194,7 +196,130 @@ CREATE TABLE IF NOT EXISTS supply_audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_supply_audit_entity
 ON supply_audit_events(entity_type, entity_id, event_id);
+
+-- 数据集驻留合规与调度联动
+CREATE TABLE IF NOT EXISTS dataset_versions (
+    dataset_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    name TEXT NOT NULL,
+    regions_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    registered_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    registered_at TEXT NOT NULL,
+    PRIMARY KEY(dataset_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS dataset_authorizations (
+    authorization_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    granted_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'granted' CHECK(state IN ('granted','withdrawn')),
+    withdrawn_at TEXT,
+    withdraw_reason TEXT,
+    batch_id TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(dataset_id, version, subject_id),
+    FOREIGN KEY(dataset_id, version) REFERENCES dataset_versions(dataset_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_authorizations_lookup
+ON dataset_authorizations(dataset_id, version, subject_id, state);
+
+CREATE TABLE IF NOT EXISTS authorization_batches (
+    batch_id TEXT PRIMARY KEY,
+    request_sha256 TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS training_plans (
+    plan_id TEXT PRIMARY KEY,
+    dataset_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    product TEXT NOT NULL,
+    requested_gpu_hours TEXT NOT NULL,
+    network_zone TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'blocked'
+        CHECK(state IN ('ready','blocked','launching','running','blocked_running','halted','cancelled')),
+    blocked_reason TEXT,
+    candidate_sites_json TEXT NOT NULL,
+    selected_site TEXT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(dataset_id, version) REFERENCES dataset_versions(dataset_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_training_plans_subject
+ON training_plans(subject_id, state, created_at);
+
+CREATE TABLE IF NOT EXISTS compliance_access_records (
+    access_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL,
+    dataset_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    site_id TEXT,
+    event_type TEXT NOT NULL CHECK(event_type IN ('plan.submitted','plan.launching','plan.ran','authorization.withdrawn_block','authorization.withdrawn_manual','plan.manual_disposition','plan.halted')),
+    detail_json TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_access_records_dataset
+ON compliance_access_records(dataset_id, version, subject_id, access_id);
 """
+
+
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_facility_boundaries(connection: sqlite3.Connection) -> None:
+    """既有库可能缺少地域与网络边界列，按列补齐，不重建表。"""
+    existing = _column_names(connection, "facilities")
+    if "region" not in existing:
+        connection.execute("ALTER TABLE facilities ADD COLUMN region TEXT")
+    if "network_zone" not in existing:
+        connection.execute("ALTER TABLE facilities ADD COLUMN network_zone TEXT")
+
+
+def _migrate_user_roles(connection: sqlite3.Connection) -> None:
+    """旧库的 supply_users 角色约束缺少 compliance/tenant，检测后安全重建。"""
+    sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='supply_users'"
+    ).fetchone()
+    if sql is not None and "'compliance'" in sql["sql"]:
+        return
+    foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+    connection.execute("PRAGMA foreign_keys=OFF")
+    connection.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        connection.executescript(
+            """
+            ALTER TABLE supply_users RENAME TO supply_users_legacy;
+            CREATE TABLE supply_users (
+                user_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','compliance','tenant')),
+                active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO supply_users(user_id,display_name,role,active,created_at)
+            SELECT user_id,display_name,role,active,created_at FROM supply_users_legacy;
+            DROP TABLE supply_users_legacy;
+            """
+        )
+    finally:
+        connection.execute("PRAGMA legacy_alter_table=OFF")
+        connection.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys else 'OFF'}")
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -209,6 +334,8 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate_facility_boundaries(connection)
+    _migrate_user_roles(connection)
 
 
 @contextmanager
