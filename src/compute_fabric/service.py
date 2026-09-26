@@ -28,17 +28,20 @@ from .planning import (
     weighted_inventory_cost,
 )
 from .storage import initialize, transaction
+from .residency_service import ResidencyServiceMixin
 
 
 ROLE_PERMISSIONS = {
     "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
+    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write", "job.read", "job.evaluate", "job.dispatch"},
     "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "auditor": {"report.read", "audit.read", "job.read", "dataset.read", "access.read"},
+    "tenant": {"job.write", "job.read", "dataset.read"},
+    "compliance": {"dataset.write", "grant.write", "grant.revoke", "version.freeze", "job.disposition", "job.read", "dataset.read", "access.read"},
 }
 
 
-class SupplyService:
+class SupplyService(ResidencyServiceMixin):
     def __init__(self, connection: sqlite3.Connection, clock=None) -> None:
         self.connection = connection
         self.clock = clock or SystemClock()
@@ -181,14 +184,16 @@ class SupplyService:
         try:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
-                    "INSERT INTO facilities(facility_id,name,kind,timezone,capacity_gpu_hours,created_at) "
-                    "VALUES(?,?,?,?,?,?)",
+                    "INSERT INTO facilities(facility_id,name,kind,timezone,capacity_gpu_hours,"
+                    "region,network_boundary,created_at) VALUES(?,?,?,?,?,?,?,?)",
                     (
                         facility.facility_id,
                         facility.name,
                         facility.kind,
                         facility.timezone,
                         decimal_text(facility.capacity_gpu_hours),
+                        facility.region,
+                        facility.network_boundary,
                         self._now(),
                     ),
                 )

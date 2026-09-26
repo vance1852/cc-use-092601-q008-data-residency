@@ -85,6 +85,40 @@ class JsonApplication:
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
+            # 数据集驻留合规与调度联动
+            if method == "POST" and path == "/datasets":
+                return Response(201, self.service.register_dataset(actor, payload))
+            if method == "POST" and path == "/datasets/versions":
+                return Response(201, self.service.register_version(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[0] == "datasets":
+                return Response(200, self.service.dataset_view(actor, parts[1]))
+            if method == "POST" and path == "/grants/import":
+                return Response(201, self.service.import_grants(actor, payload))
+            if method == "POST" and len(parts) == 3 and parts[0] == "grants" and parts[2] == "revoke":
+                return Response(200, self.service.revoke_grant(actor, parts[1], payload.get("reason", "")))
+            if method == "POST" and len(parts) == 4 and parts[0] == "datasets" and parts[1] == "versions" and parts[3] == "freeze":
+                return Response(200, self.service.freeze_version(actor, parts[2], payload.get("reason", "")))
+            if method == "POST" and path == "/job-plans":
+                return Response(201, self.service.submit_plan(actor, payload))
+            if method == "GET" and path == "/job-plans":
+                return Response(200, self.service.query_plans(
+                    actor, query.get("state", [None])[0], query.get("tenant_id", [None])[0]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "job-plans" and parts[2] == "evaluate":
+                return Response(200, self.service.evaluate_plan(actor, parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "job-plans" and parts[2] == "dispatch":
+                return Response(200, self.service.dispatch_plan(
+                    actor, parts[1], payload["facility_id"], int(payload["expected_revision"])))
+            if method == "POST" and len(parts) == 3 and parts[0] == "job-plans" and parts[2] == "running":
+                return Response(200, self.service.mark_running(actor, parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "job-plans" and parts[2] == "disposition":
+                return Response(200, self.service.dispose_plan(
+                    actor, parts[1], payload.get("action", ""), payload.get("note", "")))
+            if method == "GET" and len(parts) == 4 and parts[0] == "job-plans" and parts[2] == "sites":
+                return Response(200, self.service.explain_exclusion(actor, parts[1], parts[3]))
+            if method == "GET" and len(parts) == 2 and parts[0] == "job-plans":
+                return Response(200, self.service.get_plan(actor, parts[1]))
+            if method == "GET" and path == "/compliance/accesses":
+                return Response(200, self.service.access_log(actor, query.get("plan_id", [None])[0]))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})

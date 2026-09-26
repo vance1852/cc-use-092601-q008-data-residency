@@ -14,7 +14,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','tenant','compliance')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS facilities (
     kind TEXT NOT NULL,
     timezone TEXT NOT NULL,
     capacity_gpu_hours TEXT NOT NULL,
+    region TEXT,
+    network_boundary TEXT,
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -194,7 +196,137 @@ CREATE TABLE IF NOT EXISTS supply_audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_supply_audit_entity
 ON supply_audit_events(entity_type, entity_id, event_id);
+
+-- 数据集驻留合规与调度联动
+
+CREATE TABLE IF NOT EXISTS datasets (
+    dataset_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    owner_tenant_id TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dataset_versions (
+    version_id TEXT PRIMARY KEY,
+    dataset_id TEXT NOT NULL REFERENCES datasets(dataset_id),
+    version_tag TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    region_scope TEXT NOT NULL,
+    network_boundary TEXT NOT NULL,
+    expires_at TEXT,
+    state TEXT NOT NULL DEFAULT 'registered'
+        CHECK(state IN ('registered','frozen')),
+    frozen_reason TEXT,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(dataset_id, version_tag),
+    UNIQUE(dataset_id, content_sha256)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dataset_versions_dataset
+ON dataset_versions(dataset_id, version_tag);
+
+CREATE TABLE IF NOT EXISTS dataset_grants (
+    grant_id TEXT PRIMARY KEY,
+    dataset_id TEXT NOT NULL REFERENCES datasets(dataset_id),
+    version_id TEXT REFERENCES dataset_versions(version_id),
+    subject_id TEXT NOT NULL,
+    subject_type TEXT NOT NULL CHECK(subject_type IN ('tenant','user')),
+    region_scope TEXT NOT NULL,
+    network_boundary TEXT NOT NULL,
+    granted_at TEXT NOT NULL,
+    expires_at TEXT,
+    state TEXT NOT NULL DEFAULT 'active'
+        CHECK(state IN ('active','revoked','expired')),
+    revoked_at TEXT,
+    revoke_reason TEXT,
+    revoked_by TEXT REFERENCES supply_users(user_id),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_grants_lookup
+ON dataset_grants(dataset_id, subject_id, state);
+
+CREATE TABLE IF NOT EXISTS job_plans (
+    plan_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    version_id TEXT NOT NULL REFERENCES dataset_versions(version_id),
+    product TEXT NOT NULL,
+    scheduled_start_at TEXT NOT NULL,
+    scheduled_end_at TEXT,
+    requirements_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'planned'
+        CHECK(state IN ('planned','blocked','candidate_ready','dispatched','running','completed','cancelled','manual_hold')),
+    blocked_reason_code TEXT,
+    blocked_reason_detail TEXT,
+    last_evaluation_json TEXT,
+    facility_id TEXT REFERENCES facilities(facility_id),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    revision INTEGER NOT NULL DEFAULT 1,
+    submitted_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_plans_state
+ON job_plans(state, scheduled_start_at, plan_id);
+
+CREATE TABLE IF NOT EXISTS job_plan_candidates (
+    plan_id TEXT NOT NULL REFERENCES job_plans(plan_id),
+    facility_id TEXT NOT NULL REFERENCES facilities(facility_id),
+    eligible INTEGER NOT NULL CHECK(eligible IN (0,1)),
+    rule_code TEXT NOT NULL,
+    rule_detail TEXT NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    PRIMARY KEY(plan_id, facility_id)
+);
+
+CREATE TABLE IF NOT EXISTS compliance_accesses (
+    access_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL,
+    version_id TEXT NOT NULL,
+    facility_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    grant_id TEXT,
+    accessed_at TEXT NOT NULL,
+    access_kind TEXT NOT NULL,
+    authorized_state TEXT NOT NULL,
+    detail_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_compliance_access_plan
+ON compliance_accesses(plan_id, access_id);
+
+CREATE TABLE IF NOT EXISTS manual_dispositions (
+    disposition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL REFERENCES job_plans(plan_id),
+    previous_state TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('hold','resume','cancel','complete')),
+    note TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
 """
+
+
+MIGRATIONS = (
+    (
+        "facilities",
+        "region",
+        "ALTER TABLE facilities ADD COLUMN region TEXT",
+    ),
+    (
+        "facilities",
+        "network_boundary",
+        "ALTER TABLE facilities ADD COLUMN network_boundary TEXT",
+    ),
+)
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -209,6 +341,37 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    for table, column, statement in MIGRATIONS:
+        columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            connection.execute(statement)
+    _migrate_user_roles(connection)
+
+
+def _migrate_user_roles(connection: sqlite3.Connection) -> None:
+    """旧库的 supply_users 只允许四种角色，重建以纳入 tenant/compliance。"""
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='supply_users'"
+    ).fetchone()
+    if row is not None and "'compliance'" in row["sql"]:
+        return
+    connection.executescript(
+        """
+        PRAGMA foreign_keys=OFF;
+        CREATE TABLE IF NOT EXISTS supply_users_new (
+            user_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','tenant','compliance')),
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+            created_at TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO supply_users_new(user_id,display_name,role,active,created_at)
+        SELECT user_id,display_name,role,active,created_at FROM supply_users;
+        DROP TABLE supply_users;
+        ALTER TABLE supply_users_new RENAME TO supply_users;
+        PRAGMA foreign_keys=ON;
+        """
+    )
 
 
 @contextmanager

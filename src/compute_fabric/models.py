@@ -104,6 +104,8 @@ class Facility:
     kind: str
     timezone: str
     capacity_gpu_hours: Decimal
+    region: str | None = None
+    network_boundary: str | None = None
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "Facility":
@@ -121,6 +123,158 @@ class Facility:
             capacity_gpu_hours=decimal_value(
                 raw.get("capacity_gpu_hours"), "capacity_gpu_hours", minimum=Decimal("0")
             ),
+            region=optional_identifier(raw.get("region"), "region"),
+            network_boundary=optional_identifier(raw.get("network_boundary"), "network_boundary"),
+        )
+
+
+def optional_identifier(value: object, field: str) -> str | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return identifier(value, field)
+
+
+def region_codes(value: object, field: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValidationFailed(f"{field} 必须是非空地域代码数组")
+    codes = {identifier(item, f"{field}[]") for item in value}
+    return tuple(sorted(codes))
+
+
+def sha256_text(value: object, field: str) -> str:
+    result = required_text(value, field, 64).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", result):
+        raise ValidationFailed(f"{field} 必须是 64 位十六进制 SHA-256")
+    return result
+
+
+def expires_at_text(value: object, field: str = "expires_at") -> str | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    text = required_text(value, field, 40)
+    try:
+        return parse_utc(text, field).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        raise ValidationFailed(str(exc)) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetRegistration:
+    dataset_id: str
+    name: str
+    owner_tenant_id: str
+    description: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "DatasetRegistration":
+        description = raw.get("description", "")
+        if not isinstance(description, str):
+            raise ValidationFailed("description 必须是字符串")
+        description = description.strip()
+        if len(description) > 1024:
+            raise ValidationFailed("description 不能超过 1024 个字符")
+        return cls(
+            dataset_id=identifier(raw.get("dataset_id"), "dataset_id"),
+            name=required_text(raw.get("name"), "name"),
+            owner_tenant_id=identifier(raw.get("owner_tenant_id"), "owner_tenant_id"),
+            description=description,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetVersionInput:
+    version_id: str
+    dataset_id: str
+    version_tag: str
+    content_sha256: str
+    region_scope: tuple[str, ...]
+    network_boundary: str
+    expires_at: str | None
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "DatasetVersionInput":
+        return cls(
+            version_id=identifier(raw.get("version_id"), "version_id"),
+            dataset_id=identifier(raw.get("dataset_id"), "dataset_id"),
+            version_tag=identifier(raw.get("version_tag"), "version_tag"),
+            content_sha256=sha256_text(raw.get("content_sha256"), "content_sha256"),
+            region_scope=region_codes(raw.get("region_scope"), "region_scope"),
+            network_boundary=identifier(raw.get("network_boundary"), "network_boundary"),
+            expires_at=expires_at_text(raw.get("expires_at")),
+        )
+
+
+SUBJECT_TYPES = {"tenant", "user"}
+
+
+@dataclass(frozen=True, slots=True)
+class GrantInput:
+    grant_id: str
+    dataset_id: str
+    version_id: str | None
+    subject_id: str
+    subject_type: str
+    region_scope: tuple[str, ...]
+    network_boundary: str
+    expires_at: str | None
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "GrantInput":
+        subject_type = required_text(raw.get("subject_type"), "subject_type", 16).lower()
+        if subject_type not in SUBJECT_TYPES:
+            raise ValidationFailed("subject_type 必须是 tenant 或 user")
+        return cls(
+            grant_id=identifier(raw.get("grant_id"), "grant_id"),
+            dataset_id=identifier(raw.get("dataset_id"), "dataset_id"),
+            version_id=optional_identifier(raw.get("version_id"), "version_id"),
+            subject_id=identifier(raw.get("subject_id"), "subject_id"),
+            subject_type=subject_type,
+            region_scope=region_codes(raw.get("region_scope"), "region_scope"),
+            network_boundary=identifier(raw.get("network_boundary"), "network_boundary"),
+            expires_at=expires_at_text(raw.get("expires_at")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class JobPlanInput:
+    plan_id: str
+    tenant_id: str
+    version_id: str
+    product: str
+    scheduled_start_at: str
+    scheduled_end_at: str | None
+    required_gpu_hours: Decimal
+    idempotency_key: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "JobPlanInput":
+        product = required_text(raw.get("product"), "product", 32)
+        if product not in PRODUCTS:
+            raise ValidationFailed("product 不是受支持的资源类型")
+        start_text = required_text(raw.get("scheduled_start_at"), "scheduled_start_at", 40)
+        try:
+            start = parse_utc(start_text, "scheduled_start_at")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        end = None
+        if raw.get("scheduled_end_at") is not None:
+            try:
+                end = parse_utc(required_text(raw.get("scheduled_end_at"), "scheduled_end_at", 40), "scheduled_end_at")
+            except ValueError as exc:
+                raise ValidationFailed(str(exc)) from exc
+            if end <= start:
+                raise ValidationFailed("scheduled_end_at 必须晚于 scheduled_start_at")
+        return cls(
+            plan_id=identifier(raw.get("plan_id"), "plan_id"),
+            tenant_id=identifier(raw.get("tenant_id"), "tenant_id"),
+            version_id=identifier(raw.get("version_id"), "version_id"),
+            product=product,
+            scheduled_start_at=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            scheduled_end_at=None if end is None else end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            required_gpu_hours=decimal_value(
+                raw.get("required_gpu_hours"), "required_gpu_hours", minimum=Decimal("0.001")
+            ),
+            idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
         )
 
 
